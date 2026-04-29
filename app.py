@@ -13,6 +13,9 @@ st.set_page_config(page_title="Basket Craft Dashboard", layout="wide")
 st.title("Basket Craft Dashboard")
 
 
+AUTH_EXPIRED_ERRNO = 390114
+
+
 @st.cache_resource
 def get_connection():
     return snowflake.connector.connect(
@@ -23,12 +26,31 @@ def get_connection():
         warehouse=os.environ["SNOWFLAKE_WAREHOUSE"],
         database=os.environ["SNOWFLAKE_DATABASE"],
         schema=os.environ["SNOWFLAKE_SCHEMA"],
+        client_session_keep_alive=True,
     )
+
+
+def run_query(sql: str, params: dict | None = None) -> pd.DataFrame:
+    def _execute(conn) -> pd.DataFrame:
+        with conn.cursor() as cur:
+            cur.execute(sql, params or None)
+            cols = [c[0].lower() for c in cur.description]
+            rows = cur.fetchall()
+        return pd.DataFrame(rows, columns=cols)
+
+    try:
+        return _execute(get_connection())
+    except snowflake.connector.errors.ProgrammingError as e:
+        if e.errno != AUTH_EXPIRED_ERRNO:
+            raise
+        get_connection.clear()
+        return _execute(get_connection())
 
 
 @st.cache_data(ttl=600)
 def load_headline_metrics() -> pd.DataFrame:
-    sql = """
+    return run_query(
+        """
         WITH bounds AS (
             SELECT MAX(date_key) AS max_date
             FROM analytics.fct_order_items
@@ -65,27 +87,21 @@ def load_headline_metrics() -> pd.DataFrame:
         WHERE f.date_key >= m.prior_month
           AND f.date_key < DATEADD('month', 1, m.current_month)
         GROUP BY 1, 2
-    """
-    with get_connection().cursor() as cur:
-        cur.execute(sql)
-        cols = [c[0].lower() for c in cur.description]
-        row = cur.fetchone()
-    return pd.DataFrame([row], columns=cols)
+        """
+    )
 
 
 @st.cache_data(ttl=600)
 def load_daily_revenue() -> pd.DataFrame:
-    sql = """
+    df = run_query(
+        """
         SELECT date_key AS day,
                SUM(net_revenue_usd) AS revenue
         FROM analytics.fct_order_items
         GROUP BY day
         ORDER BY day
-    """
-    with get_connection().cursor() as cur:
-        cur.execute(sql)
-        rows = cur.fetchall()
-    df = pd.DataFrame(rows, columns=["day", "revenue"])
+        """
+    )
     df["day"] = pd.to_datetime(df["day"])
     df["revenue"] = df["revenue"].astype(float)
     return df
@@ -93,18 +109,16 @@ def load_daily_revenue() -> pd.DataFrame:
 
 @st.cache_data(ttl=600)
 def load_product_daily_revenue() -> pd.DataFrame:
-    sql = """
+    df = run_query(
+        """
         SELECT f.date_key AS day,
                p.product_name,
                SUM(f.net_revenue_usd) AS revenue
         FROM analytics.fct_order_items f
         JOIN analytics.dim_product p ON p.product_id = f.product_id
         GROUP BY f.date_key, p.product_name
-    """
-    with get_connection().cursor() as cur:
-        cur.execute(sql)
-        rows = cur.fetchall()
-    df = pd.DataFrame(rows, columns=["day", "product_name", "revenue"])
+        """
+    )
     df["day"] = pd.to_datetime(df["day"])
     df["revenue"] = df["revenue"].astype(float)
     return df
@@ -112,16 +126,15 @@ def load_product_daily_revenue() -> pd.DataFrame:
 
 @st.cache_data(ttl=600)
 def load_products() -> pd.DataFrame:
-    sql = "SELECT product_id, product_name FROM analytics.dim_product ORDER BY product_name"
-    with get_connection().cursor() as cur:
-        cur.execute(sql)
-        rows = cur.fetchall()
-    return pd.DataFrame(rows, columns=["product_id", "product_name"])
+    return run_query(
+        "SELECT product_id, product_name FROM analytics.dim_product ORDER BY product_name"
+    )
 
 
 @st.cache_data(ttl=600)
 def load_co_purchases(anchor_product_id: int) -> pd.DataFrame:
-    sql = """
+    df = run_query(
+        """
         WITH anchor_orders AS (
             SELECT DISTINCT order_id
             FROM analytics.fct_order_items
@@ -136,11 +149,9 @@ def load_co_purchases(anchor_product_id: int) -> pd.DataFrame:
         WHERE f.product_id != %(anchor_id)s
         GROUP BY p.product_name
         ORDER BY co_orders DESC
-    """
-    with get_connection().cursor() as cur:
-        cur.execute(sql, {"anchor_id": anchor_product_id})
-        rows = cur.fetchall()
-    df = pd.DataFrame(rows, columns=["product_name", "co_orders", "anchor_orders"])
+        """,
+        {"anchor_id": anchor_product_id},
+    )
     df["co_orders"] = df["co_orders"].astype(int)
     df["anchor_orders"] = df["anchor_orders"].astype(int)
     return df
@@ -148,9 +159,8 @@ def load_co_purchases(anchor_product_id: int) -> pd.DataFrame:
 
 @st.cache_data(ttl=600)
 def dim_product_row_count() -> int:
-    with get_connection().cursor() as cur:
-        cur.execute("SELECT COUNT(*) FROM analytics.dim_product")
-        return cur.fetchone()[0]
+    df = run_query("SELECT COUNT(*) AS row_count FROM analytics.dim_product")
+    return int(df.iloc[0]["row_count"])
 
 
 def fmt_month(d: date) -> str:
@@ -270,7 +280,7 @@ else:
             ],
         )
     )
-    st.altair_chart(chart, use_container_width=True)
+    st.altair_chart(chart, width="stretch")
 
 st.subheader("Bundle finder")
 st.caption("Pick a product to see what gets bought with it most often, ranked by orders containing both. Computed across all-time data.")
@@ -306,7 +316,7 @@ else:
             ],
         )
     )
-    st.altair_chart(bundle_chart, use_container_width=True)
+    st.altair_chart(bundle_chart, width="stretch")
 
 with st.expander("Snowflake smoke test"):
     st.metric("analytics.dim_product rows", f"{dim_product_row_count():,}")
